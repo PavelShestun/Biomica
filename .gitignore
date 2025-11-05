@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Generated artifacts
+results.csv
+survival_distribution.png
