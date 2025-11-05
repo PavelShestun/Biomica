@@ -1,67 +1,98 @@
 # -*- coding: utf-8 -*-
 """
-Скрипт для проведения вычислительных экспериментов.
+Усовершенствованный скрипт для проведения вычислительных экспериментов.
 
-Этот скрипт запускает симуляцию в "безголовом" режиме (без анимации)
-многократно для сбора статистически значимых данных. Результаты
-сохраняются в CSV файл для дальнейшего анализа.
+Этот скрипт позволяет систематически исследовать влияние различных параметров
+на исход симуляции. Он итерирует по сетке заданных параметров, запускает
+симуляцию многократно для каждого набора и сохраняет результаты.
+Использует tqdm для наглядного отображения прогресса.
 """
 import pandas as pd
 from main import Simulation
 from config import Config
 import time
+from tqdm import tqdm
+import itertools
 
-# --- Параметры эксперимента ---
-N_RUNS = 2  # Количество повторных прогонов для каждого набора параметров
+# --- Сетка параметров для исследования ---
+# Каждый элемент в списке 'values' будет использован в отдельном эксперименте
+PARAM_GRID = {
+    'grid_size': {'values': [100]},
+    'n_steps': {'values': [1000]},
+    'initial_bacteria_ratio': {'values': [0.1]},
+    'phage_burst_size': {'values': [5]},
+    # Пример: исследование влияния вероятности ухода в убежище
+    'p1_enter_refuge': {'values': [0.01, 0.05, 0.1]},
+    'p2_enter_refuge': {'values': [0.001]} # Фиксируем для второго производителя
+}
 
-def run_single_experiment():
+# --- Общие параметры эксперимента ---
+N_RUNS_PER_CONFIG = 5 # Количество повторов для каждой комбинации параметров
+
+def run_experiment_grid():
     """
-    Выполняет N_RUNS симуляций и возвращает результаты в виде списка словарей.
+    Выполняет симуляции по всей сетке параметров (PARAM_GRID).
     """
-    results_list = []
+    # Извлекаем имена и списки значений параметров
+    param_names = list(PARAM_GRID.keys())
+    param_value_lists = [v['values'] for v in PARAM_GRID.values()]
 
-    for i in range(N_RUNS):
-        print(f"Запуск симуляции №{i+1}/{N_RUNS}...")
-        start_time = time.time()
+    # Создаем все возможные комбинации параметров
+    param_combinations = list(itertools.product(*param_value_lists))
 
-        # Создаем новый экземпляр конфигурации и симуляции для каждого прогона
-        # чтобы гарантировать независимость результатов
-        config = Config()
-        sim = Simulation(config)
+    total_experiments = len(param_combinations) * N_RUNS_PER_CONFIG
+    print(f"--- Начало серии экспериментов ---")
+    print(f"Всего будет проведено симуляций: {total_experiments}")
+    print(f"Количество комбинаций параметров: {len(param_combinations)}")
+    print(f"Повторов на комбинацию: {N_RUNS_PER_CONFIG}")
 
-        # Запускаем симуляцию в режиме без визуализации
-        final_counts = sim.run_headless()
+    all_results = []
 
-        # Добавляем номер прогона в результаты
-        result_row = final_counts
-        result_row['run_id'] = i
+    # Основной цикл по комбинациям параметров с использованием tqdm
+    with tqdm(total=total_experiments, desc="Общий прогресс") as pbar:
+        for combo_idx, param_combo in enumerate(param_combinations):
 
-        results_list.append(result_row)
+            # Создаем словарь текущей конфигурации
+            current_params = dict(zip(param_names, param_combo))
 
-        end_time = time.time()
-        print(f"  Завершено за {end_time - start_time:.2f} секунд. Выжило (Б1/Б2): {final_counts['b1']}/{final_counts['b2']}")
+            # Запускаем N_RUNS_PER_CONFIG симуляций для данной конфигурации
+            for run_idx in range(N_RUNS_PER_CONFIG):
 
-    return results_list
+                # Создаем экземпляр конфига и переопределяем параметры
+                config = Config()
+                for param, value in current_params.items():
+                    setattr(config, param, value)
+
+                sim = Simulation(config)
+                final_counts = sim.run_headless()
+
+                # Собираем строку результата
+                result_row = {
+                    'combo_id': combo_idx,
+                    'run_id': run_idx,
+                    **current_params, # добавляем параметры эксперимента
+                    'final_b1': final_counts['b1'],
+                    'final_p1': final_counts['p1'],
+                    'final_b2': final_counts['b2'],
+                    'final_p2': final_counts['p2']
+                }
+                all_results.append(result_row)
+                pbar.update(1)
+
+    return pd.DataFrame(all_results)
 
 if __name__ == "__main__":
-    print("--- Начало вычислительного эксперимента ---")
+    start_time = time.time()
 
-    # Запускаем серию симуляций
-    results = run_single_experiment()
+    # Запускаем серию экспериментов
+    results_df = run_experiment_grid()
 
-    # Преобразуем результаты в DataFrame и сохраняем в CSV
-    results_df = pd.DataFrame(results)
-
-    # Указываем порядок столбцов для удобства
-    column_order = ['run_id', 'b1', 'p1', 'b2', 'p2']
-    results_df = results_df[column_order]
-
-    output_path = 'results.csv'
+    output_path = 'experiment_results.csv'
     results_df.to_csv(output_path, index=False)
 
-    print(f"\n--- Эксперимент завершен ---")
-    print(f"Результаты сохранены в файл: {output_path}")
+    end_time = time.time()
 
-    # Выводим базовую статистику по результатам
-    print("\nКраткая статистика по результатам:")
-    print(results_df.describe())
+    print(f"\n--- Серия экспериментов завершена за {end_time - start_time:.2f} секунд ---")
+    print(f"Результаты сохранены в файл: {output_path}")
+    print(f"\nИтоговая таблица результатов (первые 5 строк):")
+    print(results_df.head())
