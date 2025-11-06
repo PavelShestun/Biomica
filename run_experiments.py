@@ -1,98 +1,158 @@
-# -*- coding: utf-8 -*-
-"""
-Усовершенствованный скрипт для проведения вычислительных экспериментов.
-
-Этот скрипт позволяет систематически исследовать влияние различных параметров
-на исход симуляции. Он итерирует по сетке заданных параметров, запускает
-симуляцию многократно для каждого набора и сохраняет результаты.
-Использует tqdm для наглядного отображения прогресса.
-"""
 import pandas as pd
+import numpy as np
 from main import Simulation
 from config import Config
 import time
 from tqdm import tqdm
 import itertools
 
-# --- Сетка параметров для исследования ---
-# Каждый элемент в списке 'values' будет использован в отдельном эксперименте
-PARAM_GRID = {
-    'grid_size': {'values': [100]},
-    'n_steps': {'values': [1000]},
-    'initial_bacteria_ratio': {'values': [0.1]},
-    'phage_burst_size': {'values': [5]},
-    # Пример: исследование влияния вероятности ухода в убежище
-    'p1_enter_refuge': {'values': [0.01, 0.05, 0.1]},
-    'p2_enter_refuge': {'values': [0.001]} # Фиксируем для второго производителя
-}
-
-# --- Общие параметры эксперимента ---
-N_RUNS_PER_CONFIG = 5 # Количество повторов для каждой комбинации параметров
-
-def run_experiment_grid():
+def run_experiment1():
     """
-    Выполняет симуляции по всей сетке параметров (PARAM_GRID).
+    Runs Experiment 1: Find Optimal Defense Repertoire.
+    Iterates through different initial defense repertoire sizes to find the one
+    that maximizes final bacterial population.
     """
-    # Извлекаем имена и списки значений параметров
-    param_names = list(PARAM_GRID.keys())
-    param_value_lists = [v['values'] for v in PARAM_GRID.values()]
+    print("Starting Experiment 1: Find Optimal Defense Repertoire...")
+    cfg = Config()
+    # Use smaller, faster parameters for this experiment
+    cfg.GRID_SIZE = 61
+    cfg.N_BACTERIA = 150
+    cfg.INITIAL_PHAGE_COUNT = 100
+    cfg.N_FRAMES = 150
+    cfg.FRAME_ADD_PHAGE = 10
+    cfg.FRAME_MUTANT_PHAGE_APPEARS = 9999 # Mutant disabled for this experiment
 
-    # Создаем все возможные комбинации параметров
-    param_combinations = list(itertools.product(*param_value_lists))
+    # --- Experimental Parameters ---
+    repertoire_sizes = range(0, 7)
+    n_runs_per_setting = 5
 
-    total_experiments = len(param_combinations) * N_RUNS_PER_CONFIG
-    print(f"--- Начало серии экспериментов ---")
-    print(f"Всего будет проведено симуляций: {total_experiments}")
-    print(f"Количество комбинаций параметров: {len(param_combinations)}")
-    print(f"Повторов на комбинацию: {N_RUNS_PER_CONFIG}")
+    # --- Data Collection ---
+    results = []
+    run_list = list(itertools.product(repertoire_sizes, range(n_runs_per_setting)))
+
+    for rep_size, run_id in tqdm(run_list, desc="Testing Repertoire Sizes"):
+        cfg.P1_INITIAL_DEFENSE_SIZE = rep_size
+
+        sim = Simulation(cfg, use_headless=True)
+        sim.initialize_petri_dishes(init_a=True, init_b=True) # Use both for comparison in raw data
+
+        for _ in range(cfg.N_FRAMES):
+            sim.step()
+
+        final_b1 = len(sim.petri_dish_a.bacteria)
+        final_p1 = len(sim.petri_dish_a.phages)
+        final_b2 = len(sim.petri_dish_b.bacteria)
+        final_p2 = len(sim.petri_dish_b.phages)
+
+        results.append({
+            'combo_id': rep_size,
+            'run_id': run_id,
+            'P1_INITIAL_DEFENSE_SIZE': rep_size,
+            'p1_enter_refuge': cfg.P1_P_ENTER_REFUGE, # record this for clarity
+            'final_b1': final_b1,
+            'final_p1': final_p1,
+            'final_b2': final_b2,
+            'final_p2': final_p2
+        })
+
+    df = pd.DataFrame(results)
+    df.to_csv("experiment1_results.csv", index=False)
+    print("Experiment 1 complete. Results saved to experiment1_results.csv")
+
+def run_experiment2():
+    """
+    Runs Experiment 2: Compare Survival Strategies.
+    Compares three strategies: Refuge-Only, Repertoire-Only, and Hybrid.
+    """
+    print("Starting Experiment 2: Compare Survival Strategies...")
+    cfg = Config()
+    cfg.GRID_SIZE = 71
+    cfg.N_BACTERIA = 200
+    cfg.INITIAL_PHAGE_COUNT = 150
+    cfg.N_FRAMES = 200
+    cfg.FRAME_ADD_PHAGE = 10
+    cfg.FRAME_MUTANT_PHAGE_APPEARS = 100
+    cfg.MUTANT_PHAGE_REPERTOIRE = {3, 4}
+
+    scenarios = {
+        "Refuge-Only": {"initial_defense_size": 0, "p_enter_refuge": 0.1},
+        "Repertoire-Only": {"initial_defense_size": 2, "p_enter_refuge": 0.0},
+        "Hybrid": {"initial_defense_size": 2, "p_enter_refuge": 0.1}
+    }
 
     all_results = []
+    for name, params in scenarios.items():
+        print(f"Running scenario: {name}...")
+        cfg.P1_INITIAL_DEFENSE_SIZE = params["initial_defense_size"]
+        cfg.P1_P_ENTER_REFUGE = params["p_enter_refuge"]
 
-    # Основной цикл по комбинациям параметров с использованием tqdm
-    with tqdm(total=total_experiments, desc="Общий прогресс") as pbar:
-        for combo_idx, param_combo in enumerate(param_combinations):
+        sim = Simulation(cfg, use_headless=True)
+        sim.initialize_petri_dishes(init_a=True, init_b=False)
 
-            # Создаем словарь текущей конфигурации
-            current_params = dict(zip(param_names, param_combo))
+        for frame in tqdm(range(cfg.N_FRAMES), desc=f"Simulating {name}"):
+            sim.step()
+            n_bacteria = len(sim.petri_dish_a.bacteria)
+            n_phages = len(sim.petri_dish_a.phages)
+            all_results.append({"frame": frame, "scenario": name, "n_bacteria": n_bacteria, "n_phages": n_phages})
+            if n_bacteria == 0:
+                for i in range(frame + 1, cfg.N_FRAMES):
+                    all_results.append({"frame": i, "scenario": name, "n_bacteria": 0, "n_phages": n_phages})
+                break
 
-            # Запускаем N_RUNS_PER_CONFIG симуляций для данной конфигурации
-            for run_idx in range(N_RUNS_PER_CONFIG):
+    df = pd.DataFrame(all_results)
+    df.to_csv("experiment2_results.csv", index=False)
+    print("Experiment 2 complete. Results saved to experiment2_results.csv")
 
-                # Создаем экземпляр конфига и переопределяем параметры
-                config = Config()
-                for param, value in current_params.items():
-                    setattr(config, param, value)
+def run_experiment3():
+    """
+    Runs Experiment 3: Mutant Phage Stress-Test.
+    Tests the Hybrid strategy against a mutant phage that appears at different times.
+    """
+    print("Starting Experiment 3: Mutant Phage Stress-Test...")
+    cfg = Config()
+    cfg.GRID_SIZE = 61
+    cfg.N_BACTERIA = 150
+    cfg.INITIAL_PHAGE_COUNT = 100
+    cfg.N_FRAMES = 250
+    cfg.FRAME_ADD_PHAGE = 10
+    cfg.P1_INITIAL_DEFENSE_SIZE = 2
+    cfg.P1_P_ENTER_REFUGE = 0.1
+    cfg.MUTANT_PHAGE_REPERTOIRE = {3, 4}
 
-                sim = Simulation(config)
-                final_counts = sim.run_headless()
+    mutant_appearance_frames = np.linspace(15, 240, 10, dtype=int)
+    n_runs_per_setting = 3
+    results = []
+    run_list = list(itertools.product(mutant_appearance_frames, range(n_runs_per_setting)))
 
-                # Собираем строку результата
-                result_row = {
-                    'combo_id': combo_idx,
-                    'run_id': run_idx,
-                    **current_params, # добавляем параметры эксперимента
-                    'final_b1': final_counts['b1'],
-                    'final_p1': final_counts['p1'],
-                    'final_b2': final_counts['b2'],
-                    'final_p2': final_counts['p2']
-                }
-                all_results.append(result_row)
-                pbar.update(1)
+    for frame_mutant_appears, run_id in tqdm(run_list, desc="Stress-Testing Hybrid Strategy"):
+        cfg.FRAME_MUTANT_PHAGE_APPEARS = frame_mutant_appears
+        sim = Simulation(cfg, use_headless=True)
+        sim.initialize_petri_dishes(init_a=True, init_b=False)
+        for _ in range(cfg.N_FRAMES):
+            sim.step()
+        final_bacteria_count = len(sim.petri_dish_a.bacteria)
+        results.append({'mutant_appearance_frame': frame_mutant_appears, 'run_id': run_id, 'final_bacteria_count': final_bacteria_count})
 
-    return pd.DataFrame(all_results)
+    df = pd.DataFrame(results)
+    df.to_csv("experiment3_results.csv", index=False)
+    print("Experiment 3 complete. Results saved to experiment3_results.csv")
+
 
 if __name__ == "__main__":
     start_time = time.time()
 
-    # Запускаем серию экспериментов
-    results_df = run_experiment_grid()
+    # --- Instructions for running experiments ---
+    # Uncomment the function for the experiment you want to run.
+    # It is recommended to run them one at a time.
 
-    output_path = 'experiment_results.csv'
-    results_df.to_csv(output_path, index=False)
+    # print("--- Running Experiment 1 ---")
+    # run_experiment1()
+
+    # print("\n--- Running Experiment 2 ---")
+    # run_experiment2()
+
+    print("\n--- Running Experiment 3 ---")
+    run_experiment3()
 
     end_time = time.time()
-
-    print(f"\n--- Серия экспериментов завершена за {end_time - start_time:.2f} секунд ---")
-    print(f"Результаты сохранены в файл: {output_path}")
-    print(f"\nИтоговая таблица результатов (первые 5 строк):")
-    print(results_df.head())
+    print(f"\nTotal script duration: {end_time - start_time:.2f} seconds")

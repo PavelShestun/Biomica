@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import random
+import time
 from collections import defaultdict
 from scipy.ndimage import convolve
 
@@ -26,147 +27,217 @@ class Bacterium:
 
 class Phage:
     """Класс для агента-фага."""
-    def __init__(self, counters):
+    def __init__(self, counters, is_mutant=False):
         self.counters = counters
+        self.is_mutant = is_mutant
+
 
 # --- Основной класс Симуляции ---
+class PetriDish:
+    """Класс для управления состоянием одной чашки Петри."""
+    def __init__(self, grid_size, params, cfg):
+        self.grid_size = grid_size
+        self.center = grid_size // 2
+        self.params = params
+        self.cfg = cfg
+        self.grid = np.full((grid_size, grid_size), None, dtype=object)
+        self.bacteria = {}  # {(r, c): Bacterium}
+        self.phages = {}    # {(r, c): Phage}
+
+        # Инициализация среды
+        y, x = np.ogrid[-self.center:self.grid_size - self.center, -self.center:self.grid_size - self.center]
+        mask = x*x + y*y > self.cfg.RADIUS*self.cfg.RADIUS
+        self.grid[mask] = -1 # -1 означает "стена"
+
+    def add_agent(self, r, c, agent):
+        """Добавляет агента в указанную клетку."""
+        self.grid[r, c] = agent
+        if isinstance(agent, Bacterium):
+            self.bacteria[(r, c)] = agent
+        elif isinstance(agent, Phage):
+            self.phages[(r, c)] = agent
+
+    def remove_agent(self, r, c):
+        """Удаляет агента из указанной клетки."""
+        agent = self.grid[r, c]
+        self.grid[r, c] = None
+        if isinstance(agent, Bacterium):
+            self.bacteria.pop((r, c), None)
+        elif isinstance(agent, Phage):
+            self.phages.pop((r, c), None)
+        return agent
+
+    def move_agent(self, r_old, c_old, r_new, c_new):
+        """Перемещает агента из одной клетки в другую."""
+        agent = self.remove_agent(r_old, c_old)
+        if agent:
+            self.add_agent(r_new, c_new, agent)
 
 class Simulation:
     """Управляет состоянием и логикой всей симуляции."""
-    def __init__(self, cfg):
+    def __init__(self, cfg, use_headless=False):
         self.cfg = cfg
-        self.grid1, self.nutrient_grid1 = self._setup_grid(self.cfg.PRODUCER_1_PARAMS)
-        self.grid2, self.nutrient_grid2 = self._setup_grid(self.cfg.PRODUCER_2_PARAMS)
-        self.history = defaultdict(list)
+        self.use_headless = use_headless
+        self.frame = 0
+        self.petri_dish_a = None
+        self.petri_dish_b = None
 
-        self.im_data1 = np.zeros((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE, 4), dtype=np.float32)
-        self.im_data2 = np.zeros((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE, 4), dtype=np.float32)
+        if not self.use_headless:
+            self.history = defaultdict(list)
+            self.im_data_a = np.zeros((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE, 4), dtype=np.float32)
+            self.im_data_b = np.zeros((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE, 4), dtype=np.float32)
 
-    def _setup_grid(self, params):
-        """Создает начальное состояние сеток для одного производителя."""
-        grid = np.full((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE), None, dtype=object)
-        nutrient_grid = np.full((self.cfg.GRID_SIZE, self.cfg.GRID_SIZE), self.cfg.INITIAL_NUTRIENT_LEVEL, dtype=np.float32)
+    def initialize_petri_dishes(self, init_a=True, init_b=True):
+        """Инициализирует чашки Петри."""
+        if init_a:
+            self.petri_dish_a = self._setup_petri_dish(self.cfg.PRODUCER_1_PARAMS)
+        if init_b:
+            self.petri_dish_b = self._setup_petri_dish(self.cfg.PRODUCER_2_PARAMS)
 
-        y, x = np.ogrid[-self.cfg.CENTER:self.cfg.GRID_SIZE - self.cfg.CENTER,
-                        -self.cfg.CENTER:self.cfg.GRID_SIZE - self.cfg.CENTER]
-        mask = x*x + y*y > self.cfg.RADIUS*self.cfg.RADIUS
-        grid[mask] = -1
-        nutrient_grid[mask] = 0
+    def _setup_petri_dish(self, params):
+        """Создает и заселяет одну чашку Петри."""
+        dish = PetriDish(self.cfg.GRID_SIZE, params, self.cfg)
 
-        colony_radius = 5
-        for r_off in range(-colony_radius, colony_radius + 1):
-            for c_off in range(-colony_radius, colony_radius + 1):
-                if r_off**2 + c_off**2 <= colony_radius**2:
-                    r, c = self.cfg.CENTER + r_off, self.cfg.CENTER + c_off
-                    defenses = params['initial_defenses']()
-                    grid[r, c] = Bacterium(defenses=defenses, state='ACTIVE')
-        return grid, nutrient_grid
+        # Размещаем начальную колонию бактерий
+        coords_to_populate = []
+        for r_offset in range(-5, 6):
+            for c_offset in range(-5, 6):
+                if r_offset**2 + c_offset**2 <= 25:
+                     coords_to_populate.append((dish.center + r_offset, dish.center + c_offset))
 
-    def _simulation_step(self, grid_of_agents, nutrient_grid, params):
-        """Выполняет один шаг симуляции для одной сетки."""
-        new_grid = grid_of_agents.copy()
-        new_nutrient_grid = nutrient_grid.copy()
+        # Убедимся, что не пытаемся разместить больше бактерий, чем есть места
+        num_to_place = min(self.cfg.N_BACTERIA, len(coords_to_populate))
+        selected_coords = random.sample(coords_to_populate, num_to_place)
 
-        all_coords = [(r, c) for r in range(self.cfg.GRID_SIZE) for c in range(self.cfg.GRID_SIZE)]
-        random.shuffle(all_coords)
+        for r, c in selected_coords:
+            defenses = params['initial_defenses']()
+            bacterium = Bacterium(defenses=defenses, state='ACTIVE')
+            dish.add_agent(r, c, bacterium)
+        return dish
 
-        for r, c in all_coords:
-            agent = grid_of_agents[r, c]
-            if agent is None or agent == -1:
-                continue
+    def step(self):
+        """Выполняет один шаг симуляции для всех активных чашек."""
+        # События по расписанию
+        if self.frame == self.cfg.FRAME_ADD_PHAGE:
+            if self.petri_dish_a: self._add_phages(self.petri_dish_a)
+            if self.petri_dish_b: self._add_phages(self.petri_dish_b)
 
-            if isinstance(agent, Bacterium):
-                self._update_bacterium(agent, r, c, new_grid, new_nutrient_grid, params)
-            elif isinstance(agent, Phage):
-                self._update_phage(agent, r, c, new_grid)
+        if self.frame == self.cfg.FRAME_MUTANT_PHAGE_APPEARS:
+            if self.petri_dish_a: self._add_mutant_phages(self.petri_dish_a)
+            if self.petri_dish_b: self._add_mutant_phages(self.petri_dish_b)
 
-        # Диффузия питательных веществ
-        new_nutrient_grid = self._diffuse_nutrients(new_nutrient_grid)
+        # Обновление состояния
+        if self.petri_dish_a: self._simulation_step_for_dish(self.petri_dish_a)
+        if self.petri_dish_b: self._simulation_step_for_dish(self.petri_dish_b)
 
-        return new_grid, new_nutrient_grid
+        self.frame += 1
 
-    def _update_bacterium(self, agent, r, c, new_grid, nutrient_grid, params):
+    def _simulation_step_for_dish(self, dish):
+        """Выполняет один шаг симуляции для одной чашки Петри."""
+        # Обновляем бактерии
+        for (r, c), bacterium in list(dish.bacteria.items()):
+            self._update_bacterium(bacterium, r, c, dish)
+
+        # Обновляем фаги
+        for (r, c), phage in list(dish.phages.items()):
+            self._update_phage(phage, r, c, dish)
+
+    def _update_bacterium(self, bacterium, r, c, dish):
         """Обновляет состояние одной бактерии."""
-        if agent.state == 'REFUGE':
-            if random.random() < params['p_leave_refuge']: agent.state = 'ACTIVE'
-        elif agent.state == 'ACTIVE':
-            if random.random() < params['p_enter_refuge']: agent.state = 'REFUGE'
+        state_changed = False
+        # Переходы состояний
+        if bacterium.state == 'REFUGE':
+            if random.random() < dish.params['p_leave_refuge']:
+                bacterium.state = 'ACTIVE'
+                state_changed = True
+        elif bacterium.state == 'ACTIVE':
+            if random.random() < dish.params['p_enter_refuge']:
+                bacterium.state = 'REFUGE'
+                state_changed = True
 
-        if agent.state == 'ACTIVE':
-            # Рост зависит от локальных нутриентов
-            growth_prob = (self.cfg.R_MAX_GROWTH - self.cfg.COST_PER_DEFENSE * len(agent.defenses))
-            growth_prob *= nutrient_grid[r, c] # Прямая зависимость от еды
+        # Рост и размножение
+        if bacterium.state == 'ACTIVE':
+            defense_cost = sum(self.cfg.DEFENSE_COSTS.get(d, 0) for d in bacterium.defenses)
+            growth_prob = self.cfg.R_MAX_GROWTH - defense_cost
+            if state_changed:
+                growth_prob -= self.cfg.COST_PER_REFUGE_TRANSITION
 
-            if random.random() < growth_prob and nutrient_grid[r, c] > self.cfg.NUTRIENT_CONSUMPTION:
-                empty_neighbors = [pos for pos in self._get_neighbors(r,c) if new_grid[pos] is None]
+            if random.random() < growth_prob:
+                empty_neighbors = [pos for pos in self._get_neighbors(r, c) if dish.grid[pos] is None]
                 if empty_neighbors:
                     nr, nc = random.choice(empty_neighbors)
-                    # Потребление нутриентов
-                    nutrient_grid[r, c] -= self.cfg.NUTRIENT_CONSUMPTION
-                    new_defenses = self._mutate_repertoire(agent.defenses)
-                    new_grid[nr, nc] = Bacterium(defenses=new_defenses, state='ACTIVE')
+                    new_defenses = self._mutate_repertoire(bacterium.defenses)
+                    new_bacterium = Bacterium(defenses=new_defenses, state='ACTIVE')
+                    dish.add_agent(nr, nc, new_bacterium)
 
-        elif agent.state == 'INFECTED':
-            agent.infection_timer -= 1
-            if agent.infection_timer <= 0:
-                new_grid[r, c] = None
-                phage_parent = agent.infected_by
+        # Обработка инфекции
+        elif bacterium.state == 'INFECTED':
+            bacterium.infection_timer -= 1
+            if bacterium.infection_timer <= 0:
+                dish.remove_agent(r, c) # Бактерия лизируется
+                phage_parent = bacterium.infected_by
                 burst_size = int(self.cfg.BURST_SIZE_MAX - self.cfg.COST_PER_COUNTER * len(phage_parent.counters))
-                empty_neighbors = [pos for pos in self._get_neighbors(r,c, diagonal=True) if new_grid[pos] is None]
+                empty_neighbors = [pos for pos in self._get_neighbors(r, c, diagonal=True) if dish.grid[pos] is None]
                 random.shuffle(empty_neighbors)
                 for _ in range(burst_size):
                     if not empty_neighbors: break
                     nr, nc = empty_neighbors.pop()
-                    new_grid[nr, nc] = Phage(counters=phage_parent.counters)
+                    new_phage = Phage(counters=phage_parent.counters, is_mutant=phage_parent.is_mutant)
+                    dish.add_agent(nr, nc, new_phage)
 
-    def _diffuse_nutrients(self, nutrient_grid):
-        """Распространение питательных веществ по среде."""
-        kernel = np.array([[0.5, 1, 0.5],
-                           [1,  -6,  1],
-                           [0.5, 1, 0.5]]) * self.cfg.DIFFUSION_COEFFICIENT
-
-        # Применяем свертку для диффузии
-        diffusion = convolve(nutrient_grid, kernel, mode='constant', cval=0.0)
-
-        # Обновляем сетку, не выходя за пределы [0, 1]
-        nutrient_grid += diffusion
-        np.clip(nutrient_grid, 0, 1, out=nutrient_grid)
-        return nutrient_grid
-
-
-    def _update_phage(self, agent, r, c, new_grid):
+    def _update_phage(self, phage, r, c, dish):
         """Обновляет состояние одного фага."""
         if random.random() < self.cfg.P_PHAGE_DECAY:
-            new_grid[r, c] = None
+            dish.remove_agent(r, c)
             return
 
-        potential_targets = [
-            (nr, nc) for nr, nc in self._get_neighbors(r, c)
-            if isinstance(new_grid[nr, nc], Bacterium) and new_grid[nr, nc].state == 'ACTIVE' and new_grid[nr, nc].is_vulnerable_to(agent)
-        ]
+        # Поиск и заражение цели
+        potential_targets = []
+        for nr, nc in self._get_neighbors(r, c):
+            agent = dish.grid[nr, nc]
+            if isinstance(agent, Bacterium) and agent.state == 'ACTIVE' and agent.is_vulnerable_to(phage):
+                potential_targets.append((nr, nc))
 
         if potential_targets:
             target_r, target_c = random.choice(potential_targets)
-            target_bacterium = new_grid[target_r, target_c]
             if random.random() < self.cfg.P_INFECTION:
+                target_bacterium = dish.grid[target_r, target_c]
                 target_bacterium.state = 'INFECTED'
                 target_bacterium.infection_timer = self.cfg.LATENCY_PERIOD
-                target_bacterium.infected_by = agent
-                new_grid[r, c] = None
-        else:
-            empty_neighbors = [pos for pos in self._get_neighbors(r, c) if new_grid[pos] is None]
-            if empty_neighbors:
-                nr, nc = random.choice(empty_neighbors)
-                new_grid[nr, nc], new_grid[r, c] = new_grid[r, c], None
+                target_bacterium.infected_by = phage
+                dish.remove_agent(r, c) # Фаг исчезает
+                return
 
-    def _add_phages(self, grid):
-        """Добавляет фагов в сетку."""
-        empty_coords = np.argwhere(grid == None)
+        # Перемещение
+        empty_neighbors = [pos for pos in self._get_neighbors(r, c) if dish.grid[pos] is None]
+        if empty_neighbors:
+            nr, nc = random.choice(empty_neighbors)
+            dish.move_agent(r, c, nr, nc)
+
+    def _add_phages(self, dish, is_mutant=False, repertoire=None):
+        """Добавляет фагов в чашку Петри."""
+        if repertoire is None:
+            repertoire = self.cfg.PHAGE_ATTACK_REPERTOIRE if not is_mutant else self.cfg.MUTANT_PHAGE_REPERTOIRE
+
+        empty_coords = np.argwhere(dish.grid == None)
         if len(empty_coords) > self.cfg.INITIAL_PHAGE_COUNT:
             indices = np.random.choice(len(empty_coords), self.cfg.INITIAL_PHAGE_COUNT, replace=False)
             for idx in indices:
                 r, c = empty_coords[idx]
-                grid[r, c] = Phage(counters=self.cfg.PHAGE_ATTACK_REPERTOIRE)
+                new_phage = Phage(counters=repertoire, is_mutant=is_mutant)
+                dish.add_agent(r, c, new_phage)
+
+    def _add_mutant_phages(self, dish):
+        """Заменяет часть обычных фагов на мутантов."""
+        normal_phages = [(pos, p) for pos, p in dish.phages.items() if not p.is_mutant]
+        num_to_replace = max(1, int(len(normal_phages) * 0.1)) # Заменяем 10%
+
+        phages_to_replace = random.sample(normal_phages, k=min(num_to_replace, len(normal_phages)))
+
+        for (r, c), _ in phages_to_replace:
+            dish.remove_agent(r, c)
+            mutant_phage = Phage(counters=self.cfg.MUTANT_PHAGE_REPERTOIRE, is_mutant=True)
+            dish.add_agent(r, c, mutant_phage)
 
     def _get_neighbors(self, r, c, diagonal=False):
         """Вспомогательная функция для получения координат соседей."""
@@ -176,7 +247,7 @@ class Simulation:
         neighbors = []
         for dr, dc in deltas:
             nr, nc = r + dr, c + dc
-            if 0 <= nr < self.cfg.GRID_SIZE and 0 <= nc < self.cfg.GRID_SIZE:
+            if 0 <= nr < self.cfg.GRID_SIZE and 0 <= nc < self.cfg.GRID_SIZE and self.petri_dish_a.grid[nr, nc] != -1:
                 neighbors.append((nr, nc))
         return neighbors
 
@@ -194,13 +265,15 @@ class Simulation:
 
     def run_animation(self):
         """Настраивает и запускает Matplotlib анимацию."""
+        self.initialize_petri_dishes(init_a=True, init_b=True)
+
         fig, axes = plt.subplots(1, 3, figsize=(16, 6), gridspec_kw={'width_ratios': [1, 1, 1.2]})
 
-        im1 = axes[0].imshow(self.im_data1, interpolation='none')
+        im1 = axes[0].imshow(self.im_data_a, interpolation='none')
         axes[0].set_title(self.cfg.PRODUCER_1_PARAMS['name'])
         axes[0].set_xticks([]); axes[0].set_yticks([])
 
-        im2 = axes[1].imshow(self.im_data2, interpolation='none')
+        im2 = axes[1].imshow(self.im_data_b, interpolation='none')
         axes[1].set_title(self.cfg.PRODUCER_2_PARAMS['name'])
         axes[1].set_xticks([]); axes[1].set_yticks([])
 
@@ -217,25 +290,22 @@ class Simulation:
         ax_plot.set_ylabel("Численность (log шкала)")
         ax_plot.set_xlim(0, self.cfg.N_FRAMES)
         ax_plot.set_yscale('log')
-        ax_plot.set_ylim(1, np.sum(self.grid1 != -1) * 1.5)
-        ax_plot.axvline(self.cfg.FRAME_ADD_PHAGE, color='yellow', linestyle='--', lw=1, label='Внесение фагов')
+        ax_plot.set_ylim(1, self.cfg.GRID_SIZE**2)
+        ax_plot.axvline(self.cfg.FRAME_ADD_PHAGE, color='gray', linestyle='--', lw=1, label='Внесение фагов')
+        if self.cfg.FRAME_MUTANT_PHAGE_APPEARS < self.cfg.N_FRAMES:
+             ax_plot.axvline(self.cfg.FRAME_MUTANT_PHAGE_APPEARS, color='purple', linestyle='--', lw=1, label='Мутация фага')
         ax_plot.legend(loc='lower left', fontsize='small')
         ax_plot.grid(True, alpha=0.3)
         plt.tight_layout()
 
         def update(frame):
             """Основная функция обновления для анимации."""
-            if frame == self.cfg.FRAME_ADD_PHAGE:
-                self._add_phages(self.grid1)
-                self._add_phages(self.grid2)
+            self.step()
 
-            self.grid1, self.nutrient_grid1 = self._simulation_step(self.grid1, self.nutrient_grid1, self.cfg.PRODUCER_1_PARAMS)
-            self.grid2, self.nutrient_grid2 = self._simulation_step(self.grid2, self.nutrient_grid2, self.cfg.PRODUCER_2_PARAMS)
-
-            self._update_im_data(self.grid1, self.im_data1, self.nutrient_grid1)
-            self._update_im_data(self.grid2, self.im_data2, self.nutrient_grid2)
-            im1.set_data(self.im_data1)
-            im2.set_data(self.im_data2)
+            self._update_im_data(self.petri_dish_a, self.im_data_a)
+            self._update_im_data(self.petri_dish_b, self.im_data_b)
+            im1.set_data(self.im_data_a)
+            im2.set_data(self.im_data_b)
 
             self.history['t'].append(frame)
             self._collect_history()
@@ -243,72 +313,42 @@ class Simulation:
             for key, line in lines.items():
                 line.set_data(self.history['t'], self.history[key])
 
-            if frame % 20 == 0:
-                print(f"Кадр {frame}/{self.cfg.N_FRAMES}")
-
+            if frame % 20 == 0: print(f"Кадр {frame}/{self.cfg.N_FRAMES}")
             return list(lines.values()) + [im1, im2]
 
-        anim = FuncAnimation(fig, update, frames=self.cfg.N_FRAMES, interval=80, blit=True)
+        anim = FuncAnimation(fig, update, frames=self.cfg.N_FRAMES, interval=50, blit=True)
         plt.show()
 
-    def _update_im_data(self, grid, im_data, nutrient_grid):
+    def _update_im_data(self, dish, im_data):
         """Обновляет RGBA-массив для отрисовки."""
-        # Фон теперь зависит от уровня питательных веществ
-        background_color = np.clip(nutrient_grid * 0.2, 0, 1)[:, :, np.newaxis]
-        im_data[:, :, :3] = background_color
-        im_data[:, :, 3] = 1.0  # Alpha channel
+        im_data.fill(0)
+        im_data[:, :, 3] = 1.0
 
         colors = {
             'ACTIVE': [0.2, 0.8, 0.2, 1.0], 'REFUGE': [0.1, 0.3, 0.1, 1.0],
-            'INFECTED': [1.0, 1.0, 0.0, 1.0], 'PHAGE': [1.0, 0.2, 0.2, 1.0]
+            'INFECTED': [1.0, 1.0, 0.0, 1.0], 'PHAGE': [1.0, 0.2, 0.2, 1.0],
+            'MUTANT_PHAGE': [0.8, 0.0, 1.0, 1.0] # Фиолетовый
         }
-        for r in range(self.cfg.GRID_SIZE):
-            for c in range(self.cfg.GRID_SIZE):
-                agent = grid[r, c]
-                if isinstance(agent, Bacterium): im_data[r, c] = colors[agent.state]
-                elif isinstance(agent, Phage): im_data[r, c] = colors['PHAGE']
-                elif agent == -1: im_data[r,c] = [0.1, 0.1, 0.1, 1.0]
+
+        for (r,c), agent in dish.bacteria.items(): im_data[r, c] = colors[agent.state]
+        for (r,c), agent in dish.phages.items():
+             im_data[r, c] = colors['MUTANT_PHAGE'] if agent.is_mutant else colors['PHAGE']
+
+        mask = dish.grid == -1
+        im_data[mask] = [0.1, 0.1, 0.1, 1.0]
+
 
     def _collect_history(self):
         """Собирает статистику по популяциям для графика."""
-        counts = {'b1': 0, 'p1': 0, 'b2': 0, 'p2': 0}
-        for agent in self.grid1.ravel():
-            if isinstance(agent, Bacterium): counts['b1'] += 1
-            elif isinstance(agent, Phage): counts['p1'] += 1
-        for agent in self.grid2.ravel():
-            if isinstance(agent, Bacterium): counts['b2'] += 1
-            elif isinstance(agent, Phage): counts['p2'] += 1
+        self.history['b1'].append(len(self.petri_dish_a.bacteria) if self.petri_dish_a.bacteria else 1)
+        self.history['p1'].append(len(self.petri_dish_a.phages) if self.petri_dish_a.phages else 1)
+        self.history['b2'].append(len(self.petri_dish_b.bacteria) if self.petri_dish_b.bacteria else 1)
+        self.history['p2'].append(len(self.petri_dish_b.phages) if self.petri_dish_b.phages else 1)
 
-        for key, count in counts.items():
-            self.history[key].append(count if count > 0 else 1)
-
-    def run_headless(self):
-        """
-        Запускает симуляцию без визуализации для сбора данных.
-        """
-        for frame in range(self.cfg.N_FRAMES):
-            if frame == self.cfg.FRAME_ADD_PHAGE:
-                self._add_phages(self.grid1)
-                self._add_phages(self.grid2)
-
-            self.grid1, self.nutrient_grid1 = self._simulation_step(self.grid1, self.nutrient_grid1, self.cfg.PRODUCER_1_PARAMS)
-            self.grid2, self.nutrient_grid2 = self._simulation_step(self.grid2, self.nutrient_grid2, self.cfg.PRODUCER_2_PARAMS)
-
-            if frame % 100 == 0: # Выводим прогресс
-                print(f"  Шаг {frame}/{self.cfg.N_FRAMES}")
-
-        # Собираем итоговые данные
-        final_counts = {'b1': 0, 'p1': 0, 'b2': 0, 'p2': 0}
-        for agent in self.grid1.ravel():
-            if isinstance(agent, Bacterium): final_counts['b1'] += 1
-            elif isinstance(agent, Phage): final_counts['p1'] += 1
-        for agent in self.grid2.ravel():
-            if isinstance(agent, Bacterium): final_counts['b2'] += 1
-            elif isinstance(agent, Phage): final_counts['p2'] += 1
-        return final_counts
 
 if __name__ == "__main__":
-    # Этот блок теперь используется только для визуального запуска одной симуляции
     config = Config()
-    sim = Simulation(config)
+    # Пример запуска анимации с мутантом
+    # config.FRAME_MUTANT_PHAGE_APPEARS = 250
+    sim = Simulation(config, use_headless=False)
     sim.run_animation()
